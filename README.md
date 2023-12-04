@@ -2,10 +2,10 @@
 
 ## Info
 
-Leiden University's Statistics and Data Science programme
-Master's Thesis
-Student: Giorgio Spadaccini
-Supervisors: Mark van de Wiel, Marjolein Fokkema
+Leiden University's Statistics and Data Science programme\\
+**Master's Thesis**\\
+**Student:** Giorgio Spadaccini\\
+**Supervisors:** Mark van de Wiel, Marjolein Fokkema\\
 
 ## Prerequisites
 
