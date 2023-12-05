@@ -17,10 +17,8 @@ Leiden University's Statistics and Data Science programme
 
 The code is divided into three folders, each for a different dataset on which the informative Horseshoe RuleFit is tried: Friedman 1, Extra dataset, and Helius dataset.
 
-- For the two synthetic datasets Friedman 1 and Extra, the code is split into two files: the file _Simulation.Rmd_ generates the data and fits all models on it. The file _Comparison.Rmd_ uses the fitted models produced from the _Simulation.Rmd_ file to compare the quality of fit and the importance measures.
+- For the two synthetic datasets Friedman 1 and Extra, the code is split into two files: the file _Simulation.Rmd_ generates the data and fits all models on it, thus it needs to be run first. The file _Comparison.Rmd_ uses the fitted models produced from the _Simulation.Rmd_ file to compare the quality of fit and the importance measures.
 - For the Helius dataset, all code is in the _Code.Rmd_ file. The code is provided but cannot be run without data, for which access needs to be requested.
-
-All model fits and computationally intense intermediate objects are saved in _.Rda_ files. The code currently avoids re-generating any of these objects. In order to enforce generating them from scratch, remove _eval=F_ from the code chunks that generate them.
 
 ## Data
 
