@@ -1,0 +1,556 @@
+---
+title: "Extra Dataset (D2): Simulation"
+author: "Giorgio Spadaccini"
+date: '2023-12-13'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 10)
+p=1e2
+n=1e3
+rho=diag(p)
+```
+
+# Prepare setting
+
+## Load libraries
+```{r}
+library("pre")
+library("ggplot2")
+library("ggthemes")
+library("MASS")
+library("ecpc")
+library("squeezy")
+library('randcorr')
+library('mvtnorm')
+library('partykit')
+library('beepr')
+library('mlbench')
+library('glmnet')
+library('stringr')
+library('dplyr')
+library('patchwork')
+library('Matrix')
+library('data.table')
+library('treeshap')
+library('randomForest')
+library('xgboost')
+library('horseshoe')
+library('horserule')
+library('ggforce')
+```
+
+
+## Write the functions that generate the data
+
+### Data generation:
+
+```{r}
+gendata1=function(n,p=100,seed=42,rho=NULL,sd=sqrt(2)){
+  set.seed(seed)
+  if(is.null(rho)){
+    rho=diag(p)
+  }
+  u=matrix(runif(n*p),nrow=n,ncol=p)
+  
+  #currently Corr[data$x]=I, let's turn it into rho with the Chol. decomposition
+  L=chol(rho)
+  x=u%*%L
+  #define y and standardize it
+  y=2*x[,1]*(1-sin(4*pi*x[,1]))+ #perturbed linear
+    4*x[,2]+ #linear
+    x[,3]*(2*(x[,3]<=0.5)+4*(x[,3]>0.5))+ #piecewise linear, disconnected
+    (8*x[,4]-4)*(x[,4]>0.5)+ #linear on half
+    4*x[,5]*((x[,5]<=0.25)|(x[,5]>=0.75))+ #linear on the extremes
+    4*x[,6]*(x[,7]>0.75)#linear, conditioned on another predictor
+  y=y+rnorm(n,sd=sd)
+  
+  data <- data.frame(x = x, y = y)
+  return(data)
+}
+```
+
+
+## Define the Shapley functions
+
+### Shapley weights Matrix
+```{r}
+ShapleyMat=function(X,Rs,id_mat){
+  #Input:
+  #Rs is a list of rules represented as matrices whose (i,j)-th entry is R_j(x^(i)_j)
+  #this uses id_mat, not combined.terms!!!
+  #X has the linear terms only
+  
+  #Output:
+  #An npxP matrix. It splits into p stacked submatrices of size nxP. Multiplying each of these
+  #matrices by the coefficient vector beta, you get the shapley values for that predictor
+  n=nrow(X)
+  p=ncol(X)
+  P=p+nrow(id_mat)
+  #The np x P shapley contribution matrix will e sparse.
+  #We make a list of subdataframes that will indicate which entries are nonzero
+  #The first p spots are for the linear terms:
+  #Multiply by n cause it's divided by n in the end
+  Shapleymat=sparseMatrix(i=1:(n*p),j=rep(1:p,each=n),
+                          dims=c(n*p,P), x=c(apply(X,MARGIN=2,function(x){x-mean(x)})))
+  
+  #The remaining ones are for the rules:
+  #create a progress bar
+  pb = txtProgressBar(min = 0, max = length(Rs), initial = 0,style=3) 
+  
+  #Go through all the rule contributions one by one
+  for(i in 1:length(Rs)){
+    d=ncol(Rs[[i]])
+    #If d=1, then the contribution is like for linear terms
+    if(d==1){
+      #Involved predictor
+      inv_pred=which(id_mat[i,]==1)
+      
+      #Update matrix. Multiply by n cause it's divided by n in the end 
+      Shapleymat[(inv_pred-1)*n+1:n,p+i]=c(Rs[[i]]-mean(Rs[[i]]))
+      next
+    }
+    #Otherwise, id d>1, we compute the Shapleys properly
+    SSt=tcrossprod(!Rs[[i]])
+    SSt_checks=which(SSt==0,arr.ind = T)
+    SSt_points=data.frame(x=SSt_checks[,1],y=SSt_checks[,2])
+    
+    #Now go through all involved predictors and update the contribution df
+    inv_pred=which(id_mat[i,]==1)
+    for(j in 1:d){
+      #check the extra condition R_i(x_i)R_i(y_i)=0. These points are contributing
+      contributions=SSt_points[(Rs[[i]][SSt_points$x,j]*Rs[[i]][SSt_points$y,j])==0,]
+      
+      #For these points, compute the weights.
+      qx=d-diag(SSt)-Rs[[i]][,j]
+      contributions$weights=
+        (Rs[[i]][contributions$x,j]-Rs[[i]][contributions$y,j])/(n*(d-qx[contributions$x])*
+                   choose(2*d-qx[contributions$x]-qx[contributions$y]-1,d-qx[contributions$x]))
+      
+      sum_contributions=contributions |> group_by(x) |> summarise(contribution=sum(weights))
+      
+      #Add the weights to the matrix
+      Shapleymat[(inv_pred[j]-1)*n+sum_contributions$x,p+i]=sum_contributions$contribution
+    }
+    
+    #Update progress bar
+    setTxtProgressBar(pb,i)
+  }
+  
+  #close progress bar
+  close(pb)
+  
+  #Return the matrix
+  return(Shapleymat)
+}
+```
+
+
+### Auxiliary objects: create id_mat and Rs
+```{r}
+RuleMats=function(rules,x_df){
+  rules_separated=str_split_fixed(rules," & ",n=1+max(str_count(rules,'&')))
+  vars_in_term <- gsub( " .*$", "",rules_separated)
+
+  #Codify rules_separated into coding language
+  Rulesmat=matrix(paste0("x_df$",rules_separated),ncol=ncol(rules_separated))
+  Rulesmat[Rulesmat=="x_df$"]=""
+
+  #Some subrules might involve the same predictor. Those, we'd still like together
+  for(i in 1:nrow(vars_in_term)){
+    for(x_name in unique(vars_in_term[i,])){
+      #unique(vars_in_term[i,]) also includes the name "". Skip that case
+      if(x_name==''){
+        next
+      }
+      
+      #Find all spots sharing the same predictor x_name
+      indices=which(x_name==vars_in_term[i,])
+  
+      #Join back these subrules in rules_separated, place them in first occurrance
+      rules_separated[i,indices[1]]=paste(rules_separated[i,indices],collapse=' & ')
+      #In the remaining spots, we need to delete the subrule, it was already merged
+      rules_separated[i,indices[-1]]=''
+  
+      #Do the same with Rulesmat
+      Rulesmat[i,indices[1]]=paste(Rulesmat[i,indices],collapse=' & ')
+      Rulesmat[i,indices[-1]]=''
+
+      #Do the same with vars_in_term (nothing to collapse, only delete copies)
+      vars_in_term[i,indices[-1]]=''
+      }
+  }
+  #Define a matrix where M_{i,j} tells if x_j is involved in the i-th rule
+  x_names <- names(x_df)
+  id_mat <- t(apply(vars_in_term,MARGIN=1,FUN=function(x){x_names %in% x}))
+  
+  #Rulesmat defined the rules in coding. Create a function that runs it
+  parseval=function(text){return(eval(parse(text=text)))}
+
+  #Use this function to create a list of matrices. Each matrix is \{R_i(x^{(j)}_i)\}_{i,j}
+  Rs=lapply(1:nrow(Rulesmat),function(i){
+      R=matrix(unlist(apply(Rulesmat[i,,drop=F],MARGIN=2,FUN=parseval)),nrow=nrow(x_df))
+      colnames(R)=vars_in_term[i,vars_in_term[i,]!='']
+    
+      #Using vars_in_mat, reorder the matrices by predictor
+      R=R[,order(as.numeric(gsub('x.','',vars_in_term[i,vars_in_term[i,]!='']))),drop=F]
+      return(R)
+  })
+
+  return(list(RulePredMat=id_mat,Rs=Rs))
+}
+```
+
+
+
+# Generate data
+
+```{r}
+#Generate the data, center it and scale it
+train_data=gendata1(n,seed=42,p=p)
+SDy=sd(train_data$y)
+MUy=mean(train_data$y)
+train_data$y=(train_data$y-MUy)/SDy
+
+#MUy,SDy will be saved later
+```
+
+# Fit tree ensembles
+
+```{r}
+set.seed(42)
+
+rf_model <- randomForest(y ~ ., data = train_data)
+
+param <- list(objective = "reg:squarederror", max_depth = 3)
+xgb_model <- xgboost(as.matrix(train_data[,-(p+1)]), params = param, label = train_data[,(p+1)],
+                     nrounds = 200, verbose = 0)
+
+saveRDS(rf_model,'RF_fit.Rda')
+saveRDS(xgb_model,'XGB_fit.Rda')
+```
+
+
+
+# Define the functions to fit the RuleFit-like models
+
+## Custom HorseRule
+
+```{r}
+custom_HR=function(mu,eta,X,y){
+  #Calculate penalizations for rules
+  penaliz=apply(X[,-(1:p)],MARGIN=2,FUN=function(x){(2*min(mean(x),1-mean(x)))^mu/sd(x)})/
+    rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat)^eta
+  #Penalize X
+  X[,-(1:p)]=X[,-(1:p)]*rep(penaliz,each=nrow(X))
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  #Fit horseshoe
+  HS_fit=horseshoe(y=y, X=X, method.tau = "truncatedCauchy", method.sigma = "Jeffreys",
+                   burn = 250, nmc = 2000)
+  
+  #Return fit model and scaling factors
+  return(list(HS_fit=HS_fit,scaling=c(rep(1,p),penaliz)))
+}
+```
+
+## Custom Informative HorseShoe fit
+
+### One source of co-data
+
+```{r}
+CD1_ihs_fit=function(mu,eta,X,Y){
+  penaliz=apply(X[,-(1:p)],MARGIN=2,FUN=function(x){(2*min(mean(x),1-mean(x)))^mu/sd(x)})/
+    rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat)^eta
+  #Penalize X
+  X[,-(1:p)]=X[,-(1:p)]*rep(penaliz,each=nrow(X))
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  D=1
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+
+  X <- cbind(1,X)
+  ## Fit infHS
+  ihs_fit = infHS::infHS_VB(y = Y, X = X, Z = Z,
+                            M = 2, #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 2e3)
+  
+  return(list(iHS_fit=ihs_fit,scaling=c(rep(1,p),penaliz)))
+}
+```
+
+
+### Two sources of co-data
+
+```{r}
+CD2_ihs_fit=function(mu,eta,X,Y){
+  penaliz=apply(X[,-(1:p)],MARGIN=2,FUN=function(x){(2*min(mean(x),1-mean(x)))^mu/sd(x)})/
+    rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat)^eta
+  #Penalize X
+  X[,-(1:p)]=X[,-(1:p)]*rep(penaliz,each=nrow(X))
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  D=2
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+  Gr=c(rep(1,p),rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))
+  Z[[2]] = model.matrix(~ -1 + as.factor(Gr))
+
+  X <- cbind(1,X)
+  ## Fit infHS
+  ihs_fit = infHS::infHS_VB(y = Y, X = X, Z = Z,
+                            M = 2+ncol(Z[[2]]), #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 2e3)
+  
+  return(list(iHS_fit=ihs_fit,scaling=c(rep(1,p),penaliz)))
+}
+```
+
+### Three sources of co-data
+
+```{r}
+CD3_ihs_fit=function(mu,eta,X,Y){
+  D=3
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+  Gr=c(rep(1,p),rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))
+  Z[[2]] = model.matrix(~ -1 + as.factor(Gr))
+  Z[[3]] = matrix(c(rep(1,p),apply(X[,-(1:p)],MARGIN=2,FUN=function(x){min(mean(x),(1-mean(x)))})))
+
+  penaliz=apply(X[,-(1:p)],MARGIN=2,FUN=function(x){(2*min(mean(x),1-mean(x)))^mu/sd(x)})/
+    rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat)^eta
+  #Penalize X
+  X[,-(1:p)]=X[,-(1:p)]*rep(penaliz,each=nrow(X))
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  X <- cbind(1,X)
+  ## Fit infHS
+  ihs_fit = infHS::infHS_VB(y = Y, X = X, Z = Z,
+                            M = 3+ncol(Z[[2]]), #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 2e3)
+  
+  return(list(iHS_fit=ihs_fit,scaling=c(rep(1,p),penaliz)))
+}
+```
+
+
+## Custom RuleFit
+
+```{r}
+custom_pre=function(X,y){
+  #Fit cv.glmnet on re-scaled predictors
+  X[,1:p]=0.4*X[,1:p]
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  fit_obj=cv.glmnet(X,y,standardize=F)
+  
+  #Rescale coefficients to work for standardized, unscaled predictors
+  fit_obj$glmnet.fit$beta[1:p,]=fit_obj$glmnet.fit$beta[1:p,]*0.4
+  return(fit_obj)
+}
+```
+
+
+# Use RuleFit (pre) and HorseRule to build the rules and the matrices X,Y
+
+```{r}
+#Set seed
+set.seed(42)
+
+#Fit models
+pre_fit <- pre(y ~ ., data = train_data, verbose = TRUE, maxdepth = 3,fit.final=F)
+HR_fit=horserule::HorseRuleFit(X = train_data[,1:p], y=train_data$y, ensemble = "both", ntree=500, linterms=1:p,
+                                      restricted = 0,alpha=1, beta=2,
+                               niter=5,burnin=1) #no iterations are really needed, only rules
+#Start with HR rules
+rules=gsub('X\\[,','x.',HR_fit$rules)
+rules=gsub('\\]',' ',rules)
+#Add pre rules
+rules=c(pre_fit$rules$description,rules)
+
+#Save rules
+saveRDS(rules,'rules.Rda')
+```
+
+Build X and Y
+
+```{r}
+rules=readRDS('rules.Rda')
+
+modmat=pre:::get_modmat(formula = y ~., data = train_data,
+                             rules = rules,
+                             type = "both", x_names = paste0("x.", 1:p),
+                             winsfrac = 0.05, normalize = TRUE, y_names = "y")
+
+modmat$x[,1:p]=2.5*modmat$x[,1:p] #modmat normalizes predictors to sd=0.4. Make it 1
+
+
+X <- modmat$x #uncetered. They are centered in the custom fit functions
+Y <- modmat$y
+
+#Save MUy,SDy and MUx.
+saveRDS(list(mu_y=MUy,sd_y=SDy,mu_x=apply(X,MARGIN=2,FUN=mean)),'data_info.Rda')
+```
+
+
+# Fit RuleFit and all Horseshoe-based models
+
+## RuleFit
+
+```{r}
+#set seed
+set.seed(42)
+
+#Fit model
+RuleFit_fit=custom_pre(X,Y)
+
+#Save results
+saveRDS(RuleFit_fit,'RuleFit_fit.Rda')
+```
+
+
+## HorseRule
+
+```{r}
+#set seed
+set.seed(42)
+
+HR_fits=list(custom_HR(1,2,X,Y), #Standard settings
+custom_HR(0.5,2,X,Y), #Lower mu
+custom_HR(2,2,X,Y), #Higher mu
+custom_HR(1,1,X,Y), #Lower eta
+custom_HR(1,4,X,Y)) #Higher eta
+
+#Save fitted models
+saveRDS(HR_fits,'HR_fits.Rda')
+```
+
+
+## Informative Horseshoe with structured penalization
+
+### One source of co-data
+
+```{r}
+#Set seed
+set.seed(42)
+
+#Create lists with all fitted models
+CD1_fits=list(CD1_ihs_fit(1,2,X,Y), #Standard settings
+CD1_ihs_fit(0.5,2,X,Y), #Lower mu
+CD1_ihs_fit(2,2,X,Y), #Higher mu
+CD1_ihs_fit(1,1,X,Y), #Lower eta
+CD1_ihs_fit(1,4,X,Y)) #Higher eta
+
+#Save fitted models
+saveRDS(CD1_fits,'CD1_fits.Rda')
+```
+
+
+### Two sources of co-data
+
+```{r}
+#Set seed
+set.seed(42)
+
+#Create lists with all fitted models
+CD2_fits=list(CD2_ihs_fit(1,2,X,Y), #Standard settings
+CD2_ihs_fit(0.5,2,X,Y), #Lower mu
+CD2_ihs_fit(2,2,X,Y), #Higher mu
+CD2_ihs_fit(1,1,X,Y), #Lower eta
+CD2_ihs_fit(1,4,X,Y)) #Higher eta
+
+#Save fitted models
+saveRDS(CD2_fits,'CD2_fits.Rda')
+```
+
+### Three sources of co-data
+
+```{r}
+#Set seed
+set.seed(42)
+
+#Create lists with all fitted models
+CD3_fits=list(CD3_ihs_fit(1,2,X,Y), #Standard settings
+CD3_ihs_fit(0.5,2,X,Y), #Lower mu
+CD3_ihs_fit(2,2,X,Y), #Higher mu
+CD3_ihs_fit(1,1,X,Y), #Lower eta
+CD3_ihs_fit(1,4,X,Y)) #Higher eta
+
+#Save fitted models
+saveRDS(CD3_fits,'CD3_fits.Rda')
+```
+
+
+## Informative Horseshoe without structured penalization 
+
+```{r}
+set.seed(42)
+```
+
+One source of co-data:
+```{r}
+  D=1
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+  
+  ## Fit infHS
+  noSD1_fit = infHS::infHS_VB(y = Y, X = cbind(1,X), Z = Z,
+                            M = 2, #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 2e3)
+```
+
+Two sources of co-data:
+
+```{r}
+  D=2
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+  Gr=c(rep(1,p),rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))
+  Z[[2]] = model.matrix(~ -1 + as.factor(Gr)) #has 4 columns because HorseRule has depth 4
+
+  ## Fit infHS
+  noSD2_fit = infHS::infHS_VB(y = Y, X = cbind(1,X), Z = Z,
+                            M = 2+ncol(Z[[2]]),
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 500, bmax = 5e3)
+```
+
+Three sources of co-data:
+
+```{r}
+  D=3
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+  Gr=c(rep(1,p),rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))
+  Z[[2]] = model.matrix(~ -1 + as.factor(Gr))
+  Z[[3]] = matrix(c(rep(1,p),apply(X[,-(1:p)],MARGIN=2,FUN=function(x){min(mean(x),(1-mean(x)))})))
+
+  ## Fit infHS
+  noSD3_fit = infHS::infHS_VB(y = Y, X = cbind(1,X), Z = Z,
+                            M = 3+ncol(Z[[2]]), #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 2e3)
+```
+
+Save all:
+```{r}
+noSD_fits=list(noSD1_fit,noSD2_fit,noSD3_fit)
+saveRDS(noSD_fits,'noSD_fits.Rda')
+```

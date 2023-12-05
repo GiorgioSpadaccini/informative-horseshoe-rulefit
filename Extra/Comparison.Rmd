@@ -1,0 +1,848 @@
+---
+title: "Extra Dataset (D2): Comparison"
+author: "Giorgio Spadaccini"
+date: '2023-12-13'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 10)
+p=1e2
+n=1e3
+rho=diag(p)
+```
+
+# Prepare setting
+
+## Load libraries
+```{r}
+library("pre")
+library("ggplot2")
+library("ggthemes")
+library("MASS")
+library("ecpc")
+library("squeezy")
+library('randcorr')
+library('mvtnorm')
+library('partykit')
+library('beepr')
+library('mlbench')
+library('glmnet')
+library('stringr')
+library('dplyr')
+library('patchwork')
+library('Matrix')
+library('data.table')
+library('treeshap')
+library('randomForest')
+library('xgboost')
+library('horseshoe')
+library('horserule')
+library('ggforce')
+```
+
+
+## Write the functions that generate the data
+
+### Custom generation:
+
+```{r}
+gendata1=function(n,p=100,seed=42,rho=NULL,sd=sqrt(2)){
+  set.seed(seed)
+  if(is.null(rho)){
+    rho=diag(p)
+  }
+  u=matrix(runif(n*p),nrow=n,ncol=p)
+  
+  #currently Corr[data$x]=I, let's turn it into rho with the Chol. decomposition
+  L=chol(rho)
+  x=u%*%L
+  #define y and standardize it
+  y=2*x[,1]*(1-sin(4*pi*x[,1]))+ #perturbed linear
+    4*x[,2]+ #linear
+    x[,3]*(2*(x[,3]<=0.5)+4*(x[,3]>0.5))+ #piecewise linear, disconnected
+    (8*x[,4]-4)*(x[,4]>0.5)+ #linear on half
+    4*x[,5]*((x[,5]<=0.25)|(x[,5]>=0.75))+ #linear on the extremes
+    4*x[,6]*(x[,7]>0.75)#linear, conditioned on another predictor
+  y=y+rnorm(n,sd=sd)
+  
+  data <- data.frame(x = x, y = y)
+  return(data)
+}
+```
+
+## Define the Shapley functions
+
+### Shapley Matrix
+```{r}
+ShapleyMat=function(X,Rs,id_mat){
+  #Input:
+  #Rs is a list of rules represented as matrices whose (i,j)-th entry is R_j(x^(i)_j)
+  #this uses id_mat, not combined.terms!!!
+  #X has the linear terms only
+  
+  #Output:
+  #An npxP matrix. It splits into p stacked submatrices of size nxP. Multiplying each of these
+  #matrices by the coefficient vector beta, you get the shapley values for that predictor
+  n=nrow(X)
+  p=ncol(X)
+  P=p+nrow(id_mat)
+  #The np x P shapley contribution matrix will e sparse.
+  #We make a list of subdataframes that will indicate which entries are nonzero
+  #The first p spots are for the linear terms:
+  #Multiply by n cause it's divided by n in the end
+  Shapleymat=sparseMatrix(i=1:(n*p),j=rep(1:p,each=n),
+                          dims=c(n*p,P), x=c(apply(X,MARGIN=2,function(x){x-mean(x)})))
+  
+  #The remaining ones are for the rules:
+  #create a progress bar
+  pb = txtProgressBar(min = 0, max = length(Rs), initial = 0,style=3) 
+  
+  #Go through all the rule contributions one by one
+  for(i in 1:length(Rs)){
+    d=ncol(Rs[[i]])
+    #If d=1, then the contribution is like for linear terms
+    if(d==1){
+      #Involved predictor
+      inv_pred=which(id_mat[i,]==1)
+      
+      #Update matrix. Multiply by n cause it's divided by n in the end 
+      Shapleymat[(inv_pred-1)*n+1:n,p+i]=c(Rs[[i]]-mean(Rs[[i]]))
+      next
+    }
+    #Otherwise, id d>1, we compute the Shapleys properly
+    SSt=tcrossprod(!Rs[[i]])
+    SSt_checks=which(SSt==0,arr.ind = T)
+    SSt_points=data.frame(x=SSt_checks[,1],y=SSt_checks[,2])
+    
+    #Now go through all involved predictors and update the contribution df
+    inv_pred=which(id_mat[i,]==1)
+    for(j in 1:d){
+      #check the extra condition R_i(x_i)R_i(y_i)=0. These points are contributing
+      contributions=SSt_points[(Rs[[i]][SSt_points$x,j]*Rs[[i]][SSt_points$y,j])==0,]
+      
+      #For these points, compute the weights.
+      qx=d-diag(SSt)-Rs[[i]][,j]
+      contributions$weights=
+        (Rs[[i]][contributions$x,j]-Rs[[i]][contributions$y,j])/(n*(d-qx[contributions$x])*
+                   choose(2*d-qx[contributions$x]-qx[contributions$y]-1,d-qx[contributions$x]))
+      
+      sum_contributions=contributions |> group_by(x) |> summarise(contribution=sum(weights))
+      
+      #Add the weights to the matrix
+      Shapleymat[(inv_pred[j]-1)*n+sum_contributions$x,p+i]=sum_contributions$contribution
+    }
+    
+    #Update progress bar
+    setTxtProgressBar(pb,i)
+  }
+  
+  #close progress bar
+  close(pb)
+  
+  #Return the matrix
+  return(Shapleymat)
+}
+```
+
+
+### Auxiliary objects: create id_mat and Rs
+```{r}
+RuleMats=function(rules,x_df){
+  rules_separated=str_split_fixed(rules," & ",n=1+max(str_count(rules,'&')))
+  vars_in_term <- gsub( " .*$", "",rules_separated)
+
+  #Codify rules_separated into coding language
+  Rulesmat=matrix(paste0("x_df$",rules_separated),ncol=ncol(rules_separated))
+  Rulesmat[Rulesmat=="x_df$"]=""
+
+  #Some subrules might involve the same predictor. Those, we'd still like together
+  for(i in 1:nrow(vars_in_term)){
+    for(x_name in unique(vars_in_term[i,])){
+      #unique(vars_in_term[i,]) also includes the name "". Skip that case
+      if(x_name==''){
+        next
+      }
+      
+      #Find all spots sharing the same predictor x_name
+      indices=which(x_name==vars_in_term[i,])
+  
+      #Join back these subrules in rules_separated, place them in first occurrance
+      rules_separated[i,indices[1]]=paste(rules_separated[i,indices],collapse=' & ')
+      #In the remaining spots, we need to delete the subrule, it was already merged
+      rules_separated[i,indices[-1]]=''
+  
+      #Do the same with Rulesmat
+      Rulesmat[i,indices[1]]=paste(Rulesmat[i,indices],collapse=' & ')
+      Rulesmat[i,indices[-1]]=''
+
+      #Do the same with vars_in_term (nothing to collapse, only delete copies)
+      vars_in_term[i,indices[-1]]=''
+      }
+  }
+  #Define a matrix where M_{i,j} tells if x_j is involved in the i-th rule
+  x_names <- names(x_df)
+  id_mat <- t(apply(vars_in_term,MARGIN=1,FUN=function(x){x_names %in% x}))
+  
+  #Rulesmat defined the rules in coding. Create a function that runs it
+  parseval=function(text){return(eval(parse(text=text)))}
+
+  #Use this function to create a list of matrices. Each matrix is \{R_i(x^{(j)}_i)\}_{i,j}
+  Rs=lapply(1:nrow(Rulesmat),function(i){
+      R=matrix(unlist(apply(Rulesmat[i,,drop=F],MARGIN=2,FUN=parseval)),nrow=nrow(x_df))
+      colnames(R)=vars_in_term[i,vars_in_term[i,]!='']
+    
+      #Using vars_in_mat, reorder the matrices by predictor
+      R=R[,order(as.numeric(gsub('x.','',vars_in_term[i,vars_in_term[i,]!='']))),drop=F]
+      return(R)
+  })
+
+  return(list(RulePredMat=id_mat,Rs=Rs))
+}
+```
+
+
+
+## Friedman-Popescu importance
+
+```{r}
+# Local measure, as defined originally, with absolute values
+FriedPopLocalAbs=function(X,x_df,rules,beta){
+  #X and beta without intercept
+  #Center the columns of X, take absolute values
+  X=apply(X,MARGIN=2,FUN=function(x){abs(x-mean(x))})
+  
+  #Adjust matrix to take into account the contribution as 1/d
+  mats=RuleMats(rules,x_df)
+  A=t(apply(rbind(diag(p),mats$RulePredMat),MARGIN=1,FUN=function(x){x/sum(x)}))
+  
+  #Compute and return the local measures
+  return(X%*%diag(abs(beta))%*%A)
+}
+
+# Local measure, adjusted to be for profile
+FriedPopLocal=function(X,x_df,rules,beta){
+  #X and beta without intercept
+  #Center the columns of X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  #Adjust matrix to take into account the contribution as 1/d
+  mats=RuleMats(rules,x_df)
+  A=t(apply(rbind(diag(p),mats$RulePredMat),MARGIN=1,FUN=function(x){x/sum(x)}))
+  
+  #Compute and return the local measures
+  return(X%*%diag(beta)%*%A)
+}
+
+#Global measure
+FriedPopGlobal=function(X,x_df,rules,beta){
+  #X and beta without intercept
+  #Take standard deviations of predictors
+  sdX=apply(X,MARGIN=2,FUN=function(x){sd(x)})
+  
+  #Adjust matrix to take into account the contribution as 1/d
+  mats=RuleMats(rules,x_df)
+  A=t(apply(rbind(diag(p),mats$RulePredMat),MARGIN=1,FUN=function(x){x/sum(x)}))
+  
+  #Compute and return the local measures
+  return(c((sdX*abs(beta))%*%A))
+}
+```
+
+
+# Generate data
+
+```{r}
+train_data=gendata1(n,seed=42,p=p,sd=sqrt(5))
+SDy=sd(train_data$y)
+train_data$y=train_data$y/SDy
+rules=readRDS('rules.Rda')
+
+modmat=pre:::get_modmat(formula = y ~., data = train_data,
+                             rules = rules,
+                             type = "both", x_names = paste0("x.", 1:p),
+                             winsfrac = 0.05, normalize = TRUE, y_names = "y")
+
+modmat$x[,1:p]=2.5*modmat$x[,1:p] #modmat normalizes predictors to sd=0.4. Make it 1
+
+#Fit infHS
+X <- modmat$x
+Y <- modmat$y
+```
+
+# Compare models
+
+```{r}
+#Load models
+CD1_fits=readRDS('CD1_fits.Rda')
+CD2_fits=readRDS('CD2_fits.Rda')
+CD3_fits=readRDS('CD3_fits.Rda')
+HR_fits=readRDS('HR_fits.Rda')
+rf_model=readRDS('RF_fit.Rda')
+xgb_model=readRDS('XGB_fit.Rda')
+RuleFit_fit=readRDS('RuleFit_fit.Rda')
+noSD_fits=readRDS('noSD_fits.Rda')
+#Load data info
+data_info=readRDS('data_info.Rda')
+
+  
+#Generate test data
+test_data = gendata1(1e4, seed = 41,sd=sqrt(5))
+
+test_modmat=pre:::get_modmat(formula = y ~., data = test_data,
+                             rules = rules,
+                             type = "both", x_names = paste0("x.", 1:p),
+                             winsfrac=0.05, normalize = TRUE, y_names = "y")
+test_modmat$x[,1:p]=2.5*test_modmat$x[,1:p]
+
+#Adjust scale and offset as per training data
+Y_test <- (test_data$y-data_info$mu_y)/data_info$sd_y
+X_test <- test_modmat$x-rep(data_info$mu_x,each=nrow(test_modmat$x))
+```
+
+
+## Compare performances (MSE)
+
+```{r}
+#Compute MSEs
+MSEs=rep(NA,26)
+MSEs[1:2]=c(mean((Y_test-predict(rf_model,test_data[,1:p]))^2),
+       mean((Y_test-predict(xgb_model,as.matrix(test_data[,1:p])))^2))
+MSEs[3]=mean((Y_test-predict(RuleFit_fit, X_test))^2)
+MSEs[4:8]=c(mean((Y_test-X_test%*%(HR_fits[[1]]$HS_fit$BetaHat*HR_fits[[1]]$scaling))^2),
+            mean((Y_test-X_test%*%(HR_fits[[2]]$HS_fit$BetaHat*HR_fits[[2]]$scaling))^2),
+            mean((Y_test-X_test%*%(HR_fits[[3]]$HS_fit$BetaHat*HR_fits[[3]]$scaling))^2),
+            mean((Y_test-X_test%*%(HR_fits[[4]]$HS_fit$BetaHat*HR_fits[[4]]$scaling))^2),
+            mean((Y_test-X_test%*%(HR_fits[[5]]$HS_fit$BetaHat*HR_fits[[5]]$scaling))^2))
+MSEs[9:13]=c(mean((Y_test-cbind(1,X_test)%*%(CD1_fits[[1]]$iHS_fit$beta*c(1,CD1_fits[[1]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD1_fits[[2]]$iHS_fit$beta*c(1,CD1_fits[[2]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD1_fits[[3]]$iHS_fit$beta*c(1,CD1_fits[[3]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD1_fits[[4]]$iHS_fit$beta*c(1,CD1_fits[[4]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD1_fits[[5]]$iHS_fit$beta*c(1,CD1_fits[[5]]$scaling)))^2))
+MSEs[14:18]=c(mean((Y_test-cbind(1,X_test)%*%(CD2_fits[[1]]$iHS_fit$beta*c(1,CD2_fits[[1]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD2_fits[[2]]$iHS_fit$beta*c(1,CD2_fits[[2]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD2_fits[[3]]$iHS_fit$beta*c(1,CD2_fits[[3]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD2_fits[[4]]$iHS_fit$beta*c(1,CD2_fits[[4]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD2_fits[[5]]$iHS_fit$beta*c(1,CD2_fits[[5]]$scaling)))^2))
+MSEs[19:23]=c(mean((Y_test-cbind(1,X_test)%*%(CD3_fits[[1]]$iHS_fit$beta*c(1,CD3_fits[[1]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD3_fits[[2]]$iHS_fit$beta*c(1,CD3_fits[[2]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD3_fits[[3]]$iHS_fit$beta*c(1,CD3_fits[[3]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD3_fits[[4]]$iHS_fit$beta*c(1,CD3_fits[[4]]$scaling)))^2),
+             mean((Y_test-cbind(1,X_test)%*%(CD3_fits[[5]]$iHS_fit$beta*c(1,CD3_fits[[5]]$scaling)))^2))
+MSEs[24:26]=c(mean((Y_test-cbind(1,X_test)%*%noSD_fits[[1]]$beta)^2),
+              mean((Y_test-cbind(1,X_test)%*%noSD_fits[[2]]$beta)^2),
+              mean((Y_test-cbind(1,X_test)%*%noSD_fits[[3]]$beta)^2))
+
+names(MSEs)=c('RF','XGBoost','pre',paste('HR -',1:5),paste('CD1 -',1:5),
+              paste('CD2 -',1:5),paste('CD3 -',1:5),paste('noSD -',1:3))
+
+#Save file
+saveRDS(MSEs,'MSEs.Rda')
+```
+
+
+```{r}
+readRDS('MSEs.Rda')
+```
+
+
+The irreducible error is approximatively 0.17
+
+## Compare coefficient distributions
+
+## RuleFit
+
+```{r}
+all_coeffs=abs(c(as.matrix(coef(RuleFit_fit)))[-1])
+
+#Most predictors are shrunken to zero. Save the indices of these predictors, you will ignore them
+shrunken=(all_coeffs == 0)
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))))
+
+#Only select non-shrunken predictors
+coefficients_df=coefficients_df[!shrunken,]
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+ggplot(coefficients_df, aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.02)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  theme(legend.text=element_text(size=20),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+### HorseRule
+
+```{r}
+all_coeffs=abs(c(HR_fits[[1]]$HS_fit$BetaHat*HR_fits[[1]]$scaling,
+                 HR_fits[[2]]$HS_fit$BetaHat*HR_fits[[2]]$scaling,
+                 HR_fits[[3]]$HS_fit$BetaHat*HR_fits[[3]]$scaling,
+                 HR_fits[[4]]$HS_fit$BetaHat*HR_fits[[4]]$scaling,
+                 HR_fits[[5]]$HS_fit$BetaHat*HR_fits[[5]]$scaling))
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', str_count(rules,'&')+1)),
+                           params=rep(c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1',
+                                        'mu=1,eta=4'),each=length(all_coeffs)/5))
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+#Filter out to keep only the 10% highest coefficients
+
+l=length(all_coeffs)/5
+orders=c(order(all_coeffs[1:l],decreasing = T),
+         order(all_coeffs[(l+1):(2*l)],decreasing = T),
+         order(all_coeffs[(2*l+1):(3*l)],decreasing = T),
+         order(all_coeffs[(3*l+1):(4*l)],decreasing = T),
+         order(all_coeffs[(4*l+1):(5*l)],decreasing = T))
+
+df_filter=orders <= l/10
+
+ggplot(coefficients_df[df_filter,], aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.005)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  facet_grid(factor(params, levels = c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1','mu=1,eta=4')) ~ .)+
+  theme(legend.text=element_text(size=20),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+
+### CD1 - One co-data source
+
+```{r}
+all_coeffs=abs(c(CD1_fits[[1]]$iHS_fit$beta[-1]*CD1_fits[[1]]$scaling,
+                 CD1_fits[[2]]$iHS_fit$beta[-1]*CD1_fits[[2]]$scaling,
+                 CD1_fits[[3]]$iHS_fit$beta[-1]*CD1_fits[[3]]$scaling,
+                 CD1_fits[[4]]$iHS_fit$beta[-1]*CD1_fits[[4]]$scaling,
+                 CD1_fits[[5]]$iHS_fit$beta[-1]*CD1_fits[[5]]$scaling))
+
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))),
+                           params=rep(c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1',
+                                        'mu=1,eta=4'), each=length(all_coeffs)/5))
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+l=length(all_coeffs)/5
+orders=c(order(all_coeffs[1:l],decreasing = T),
+         order(all_coeffs[(l+1):(2*l)],decreasing = T),
+         order(all_coeffs[(2*l+1):(3*l)],decreasing = T),
+         order(all_coeffs[(3*l+1):(4*l)],decreasing = T),
+         order(all_coeffs[(4*l+1):(5*l)],decreasing = T))
+
+df_filter=orders <= l/10
+
+ggplot(coefficients_df[df_filter,], aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.005)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  facet_grid(factor(params, levels = c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1','mu=1,eta=4')) ~ .)+
+  theme(legend.text=element_text(size=17),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+
+
+### CD2 - Two co-data sources
+
+```{r}
+all_coeffs=abs(c(CD2_fits[[1]]$iHS_fit$beta[-1]*CD2_fits[[1]]$scaling,
+                 CD2_fits[[2]]$iHS_fit$beta[-1]*CD2_fits[[2]]$scaling,
+                 CD2_fits[[3]]$iHS_fit$beta[-1]*CD2_fits[[3]]$scaling,
+                 CD2_fits[[4]]$iHS_fit$beta[-1]*CD2_fits[[4]]$scaling,
+                 CD2_fits[[5]]$iHS_fit$beta[-1]*CD2_fits[[5]]$scaling))
+
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))),
+                           params=rep(c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1',
+                                        'mu=1,eta=4'), each=length(all_coeffs)/5))
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+l=length(all_coeffs)/5
+orders=c(order(all_coeffs[1:l],decreasing = T),
+         order(all_coeffs[(l+1):(2*l)],decreasing = T),
+         order(all_coeffs[(2*l+1):(3*l)],decreasing = T),
+         order(all_coeffs[(3*l+1):(4*l)],decreasing = T),
+         order(all_coeffs[(4*l+1):(5*l)],decreasing = T))
+
+df_filter=orders <= l/10
+
+ggplot(coefficients_df[df_filter,], aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.005)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  facet_grid(factor(params, levels = c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1','mu=1,eta=4')) ~ .)+
+  theme(legend.text=element_text(size=17),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+
+
+### CD3 - Three co-data sources
+
+```{r}
+all_coeffs=abs(c(CD3_fits[[1]]$iHS_fit$beta[-1]*CD3_fits[[1]]$scaling,
+                 CD3_fits[[2]]$iHS_fit$beta[-1]*CD3_fits[[2]]$scaling,
+                 CD3_fits[[3]]$iHS_fit$beta[-1]*CD3_fits[[3]]$scaling,
+                 CD3_fits[[4]]$iHS_fit$beta[-1]*CD3_fits[[4]]$scaling,
+                 CD3_fits[[5]]$iHS_fit$beta[-1]*CD3_fits[[5]]$scaling))
+
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))),
+                           params=rep(c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1',
+                                        'mu=1,eta=4'), each=length(all_coeffs)/5))
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+l=length(all_coeffs)/5
+orders=c(order(all_coeffs[1:l],decreasing = T),
+         order(all_coeffs[(l+1):(2*l)],decreasing = T),
+         order(all_coeffs[(2*l+1):(3*l)],decreasing = T),
+         order(all_coeffs[(3*l+1):(4*l)],decreasing = T),
+         order(all_coeffs[(4*l+1):(5*l)],decreasing = T))
+
+df_filter=orders <= l/10
+
+ggplot(coefficients_df[df_filter,], aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.005)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  facet_grid(factor(params, levels = c('mu=1,eta=2','mu=0.5,eta=2','mu=2,eta=2','mu=1,eta=1','mu=1,eta=4')) ~ .)+
+  theme(legend.text=element_text(size=17),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+### Non-standardized informative Horseshoe
+
+```{r}
+all_coeffs=c(abs(noSD_fits[[1]]$beta[-1]),
+             abs(noSD_fits[[2]]$beta[-1]),
+             abs(noSD_fits[[3]]$beta[-1]))
+
+all_coeffs=sqrt(all_coeffs)
+
+coefficients_df=data.frame(coeff=all_coeffs,
+                           type=c(rep('Linear',p),
+                           paste('Rule - Depth', rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat))),
+                           sources=rep(c('1 source','2 sources','3 sources'), each=length(all_coeffs)/3))
+
+coefficients_df$type <- factor(coefficients_df$type, levels = c('Rule - Depth 4','Rule - Depth 3','Rule - Depth 2','Rule - Depth 1','Linear'))
+
+l=length(all_coeffs)/5
+orders=c(order(all_coeffs[1:l],decreasing = T),
+         order(all_coeffs[(l+1):(2*l)],decreasing = T),
+         order(all_coeffs[(2*l+1):(3*l)],decreasing = T),
+         order(all_coeffs[(3*l+1):(4*l)],decreasing = T),
+         order(all_coeffs[(4*l+1):(5*l)],decreasing = T))
+
+df_filter=orders <= l/10
+
+ggplot(coefficients_df[df_filter,], aes(coeff,fill = type,order=type)) +
+  geom_histogram(binwidth = 0.005)+
+  scale_fill_manual(values=c('Rule - Depth 4' = '#1a5dc7', 'Rule - Depth 3' = '#3e7cde','Rule - Depth 2' = '#699df0','Rule - Depth 1' = '#94bdff','Linear' = '#e35444'))+
+  facet_grid(sources ~ .)+
+  theme(legend.text=element_text(size=17),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+ xlab('Absolute value of the coefficient (sqrt scale)')+
+  guides(fill = guide_legend(
+  title='Type of term:     '))+xlim(0,0.7)
+```
+
+
+
+# SHAP importance measures
+
+Focus on mu=1, eta=2.
+
+```{r}
+set.seed(42)
+```
+
+## Re-fit InfHS with gibbs sampler
+```{r}
+#Prepare arguments of ihs fit (co-data)
+D=1
+Z=list()
+Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)), rep(1,ncol(X)-p)),ncol=2)
+
+#Fit model
+ihs_fit = infHS::infHS_FB(2250, #iterations
+                             250, #number of burn-in iterations
+                             y = Y, X = cbind(1,X),
+                          Z = Z, M = ncol(Z[[1]]), hyp_sigma = c(1, 10), 
+                          a_k = rep(1, D), b_k = rep(10, D), ping = 500)
+
+saveRDS(ihs_fit,'ihs_fit.Rda')
+```
+
+
+## Compute the Shapley values
+
+```{r}
+rules=readRDS('rules.Rda')
+ihs_fit=readRDS('ihs_fit.Rda')
+
+rule_objects=RuleMats(rules,train_data[,1:p])
+
+WeightMatrix=ShapleyMat(modmat$x[,1:p],rule_objects$Rs,rule_objects$RulePredMat)
+
+all_shapleys=WeightMatrix%*%t(ihs_fit$Beta[,-1])
+
+shapley_CIs=t(apply(all_shapleys, MARGIN=1, FUN=function(x){c(quantile(x,c(0.025,0.975)),mean(x))}))
+
+shapley_df=data.frame(x=c(as.matrix(train_data[,1:p])),
+                      val=shapley_CIs,
+                      predictor=rep(1:p,each=nrow(train_data)),
+                      datapoint=1:nrow(train_data))
+colnames(shapley_df)[2:4]=c('CIinf','CIsup','val')
+
+saveRDS(shapley_df,'shapley_df.Rda')
+```
+
+## Create a Sinaplot for shapley values (using fill=x cause they're all unifom)
+
+```{r}
+shapley_df=readRDS('shapley_df.Rda')
+
+ggplot(shapley_df[shapley_df$predictor %in% 1:10,], aes(x = val, y = factor(paste0('x.',predictor),levels=paste0('x.',10:1)), color = x)) +
+  scale_color_gradientn(colours=c('blue','purple','red'),na.value = "transparent",
+                           breaks=c(0,0.5,1),labels=c("Min.",'',"Max."),
+                           limits=c(0,1), guide=guide_colourbar(title="Feature value", label.position='left',title.position = 'right',title.hjust = 0.5)) +
+  geom_vline(xintercept = 0, color = "gray", linewidth=1)+
+  geom_sina(size=2,scale = FALSE) +
+  labs(
+    x = "Shapley Value",
+    y = "Predictor") +
+  theme_classic()+theme(legend.key.height= unit(4.5, 'cm'),panel.grid.minor = element_blank(),panel.grid.major = element_blank(), axis.line.y=element_blank(), legend.text=element_text(size=17), axis.text=element_text(size=20),
+        legend.title=element_text(size=17,angle=-90),axis.title=element_text(size=20))
+```
+
+## Heatmap (with plot on top)
+```{r}
+ihs_fit=readRDS('ihs_fit.Rda')
+```
+
+```{r}
+#Perform clustering on shapley values, to determine the order of the points in the heatmap
+#we are gently half-standardizing to force clustering to also take into account non-strong
+#predictors. we don't standardize fully cause strong predictors are more important
+#yhat is included in the clustering, to make the plot smoother
+
+#Compute yhat
+yhat=rowMeans(X%*%t(ihs_fit$Beta[,-1]))
+yhat=(yhat-mean(yhat))/sd(yhat)
+
+#Cluster to obtain the order of the points
+Delta=dist(apply(matrix(c(shapley_df$val,yhat),nrow=n),2,function(x){x/(sd(x)^0.5)}))
+HC_fit=hclust(Delta,method = 'average')
+points_order=order(HC_fit$order)
+shapley_df$order=points_order
+
+#Build the linear plot on top
+p1_df=data.frame(order=1:n,yhat=yhat[HC_fit$order])
+
+p1=ggplot(p1_df, aes(x = order, y = yhat)) +
+  geom_hline(yintercept = 0, color = "gray", linewidth=1, linetype=2)+
+  theme_classic()+
+  theme(axis.line = element_blank(),axis.title.x = element_blank(),
+        axis.ticks = element_blank(),axis.text = element_blank(),
+        axis.title.y=element_text(angle=0,vjust = 0.45,size=20))+
+  ylab(expression(hat(y)))+
+  geom_line()
+
+#Build heatmap at the bottom
+break_points=c(min(shapley_df$val),0,max(shapley_df$val))
+break_labs=c(formatC(min(shapley_df$val), digits = 3, format = "f"),
+                    '0',formatC(max(shapley_df$val), digits = 3, format = "f"))
+
+p2=ggplot(shapley_df[shapley_df$predictor %in% 1:10,], aes(x = order, y = factor(paste0('x.',predictor),levels=paste0('x.',10:1)), fill = val)) +
+  scale_fill_gradient2(low='blue',high='red',mid='white',midpoint = 0,breaks=break_points,
+                       labels=break_labs, guide=guide_colourbar(title="Shapley value", label.position='left',title.position = 'right', title.hjust = 0.5)) +
+  geom_tile()+
+  theme_classic()+
+  labs(x = "Datapoint",y = "Predictor") +
+  theme(legend.key.height= unit(4, 'cm'),axis.line=element_blank(),
+        axis.ticks = element_blank(), axis.text.x = element_blank(),
+        legend.text=element_text(size=17), axis.text=element_text(size=20),
+        legend.title=element_text(size=17,angle=-90),axis.title=element_text(size=20))
+
+#Combine plots
+combined_plot <- cowplot::plot_grid(p1, p2, align = 'v', hjust = -1,
+                   nrow = 2,axis = 'lr', rel_heights=c(1.5,10))
+
+combined_plot
+```
+
+## Scatterplot
+```{r}
+ggplot(shapley_df[shapley_df$predictor == 3,], aes(x = x, y = val),color='steelblue',fill='steelblue',col='blue') +
+  geom_errorbar(aes(x=x,ymin=CIinf,ymax=CIsup),col='steelblue')+
+  geom_point(size=1.5) +
+  labs(x = "x.1", y = "Shapley value") +
+  theme_bw()
+```
+
+# Friedman vs Shapley
+
+All terms:
+
+```{r}
+data_info=readRDS('data_info.Rda')
+x=as.matrix(train_data[,1:p])
+OG_values=c(2*x[,1]*(1-sin(4*pi*x[,1])),
+    4*x[,2],
+    x[,3]*(2*(x[,3]<=0.5)+4*(x[,3]>0.5)),
+    (8*x[,4]-4)*(x[,4]>0.5),
+    4*(x[,5]-0.5)*((x[,5]<=0.25)|(x[,5]>=0.75)),
+    4*x[,6]*(x[,7]>0.75),
+    4*x[,6]*(x[,7]>0.75))/data_info$sd_y
+
+#Center OG_values and add irrelevant terms
+OG_values=c(apply(matrix(OG_values,nrow=n),MARGIN=2,FUN=function(x){x-mean(x)}),
+            rep(0,n*(p-7)))
+
+#Add them to the dataframe
+loc_imps=rbind(data.frame(x=c(x),value=OG_values,type='True contribution',predictor=rep(1:p,each=n)),
+      data.frame(x=shapley_df$x,value=shapley_df$val,type='Shapley',predictor=shapley_df$predictor),
+      data.frame(x=c(x),value=c(FriedPopLocal(X,train_data[,1:p],rules,colMeans(ihs_fit$Beta[,-1]))),type='Friedman-Popescu, sign-sensitive',predictor=rep(1:p,each=n)),
+      data.frame(x=c(x),value=c(FriedPopLocalAbs(X,train_data[,1:p],rules,colMeans(ihs_fit$Beta[,-1]))),type='Friedman-Popescu, + absolute value',predictor=rep(1:p,each=n)),
+      data.frame(x=c(x),value=-c(FriedPopLocalAbs(X,train_data[,1:p],rules,colMeans(ihs_fit$Beta[,-1]))),type='Friedman-Popescu, - absolute value',predictor=rep(1:p,each=n)))
+
+
+#Plot the results
+ggplot(loc_imps[loc_imps$predictor <= 10 & loc_imps$predictor != 6 & loc_imps$predictor != 7,], aes(x = x, y = value, color = type)) +
+  geom_point(size=0.5) +
+  geom_line()+
+  facet_grid(factor(paste0('x.',predictor),levels=paste0('x.',c(1:5,8:10))) ~ ., scales = "fixed") +
+  labs(x = "x", y = "Contribution") +
+  theme(legend.text=element_text(size=17),
+        axis.text=element_text(size=20),strip.text.y = element_text(size=20),
+        legend.title=element_text(size=20),axis.title=element_text(size=20),
+        legend.position = "right", legend.box = "vertical",
+        legend.direction = "vertical")+
+  theme_bw()
+```
+
+Predictors 6 and 7 together:
+
+```{r}
+combi_shapleys_df=rbind(data.frame(
+  value=loc_imps$value[loc_imps$predictor == 6 & loc_imps$type == 'Friedman-Popescu, sign-sensitive']+loc_imps$value[loc_imps$predictor == 7 & loc_imps$type == 'Friedman-Popescu, sign-sensitive'],type='Friedman-Popescu, sign-sensitive', true=loc_imps$value[loc_imps$type=='True contribution' & loc_imps$predictor==6]),
+  data.frame(
+  value=loc_imps$value[loc_imps$predictor == 6 & loc_imps$type == 'Friedman-Popescu, + absolute value']+loc_imps$value[loc_imps$predictor == 7 & loc_imps$type == 'Friedman-Popescu, + absolute value'],type='Friedman-Popescu, absolute value', true=loc_imps$value[loc_imps$type=='True contribution' & loc_imps$predictor==6]),
+  data.frame(
+  value=loc_imps$value[loc_imps$predictor == 6 & loc_imps$type == 'Shapley']+loc_imps$value[loc_imps$predictor == 7 & loc_imps$type == 'Shapley'],type='Shapley',
+  true=loc_imps$value[loc_imps$type=='True contribution' & loc_imps$predictor==6]))
+
+plot1=ggplot(combi_shapleys_df)+
+  geom_point(aes(x=true,y=value,color=type))+
+  geom_segment(x=-6,xend=6,y=-6,yend=6)
+
+plot1+
+  theme(legend.key.size = unit(0.75, 'cm'),legend.text=element_text(size=15),
+        axis.text=element_text(size=20),
+        legend.title=element_text(size=15),axis.title=element_text(size=20),
+        legend.position = "bottom", legend.box = "horizontal",
+        legend.direction = "horizontal")+ xlab('True joint contribution')+
+  ylab('Estimated joint contribution')+
+  guides(color = guide_legend(
+  title='Type of estimation:     '))+xlim(-.25,1)+ylim(-.25,1)
+```
+
+
+# Global importance measures
+
+```{r}
+rules=readRDS('rules.Rda')
+ihs_fit=readRDS('ihs_fit.Rda')
+shapley_df=readRDS('shapley_df.Rda')
+
+imp_measures = shapley_df %>% group_by(predictor) %>% 
+  summarise(pctg_sign=mean(sign(CIinf)==sign(CIsup)),
+            CI_dist=mean(pmax(0,pmin(sign(CIsup)*CIinf,abs(CIsup)))),
+            shap=mean(abs(val)),
+            CI_width=mean(abs(CIsup-CIinf)))
+
+imp_measures=imp_measures[order(imp_measures$predictor),]
+
+imp_measures$FriedPop=FriedPopGlobal(X,train_data[,1:p],rules,colMeans(ihs_fit$Beta[,-1]))
+
+imp_measures$benchmark=c(integrate(function(x){abs(2*x*(1-sin(4*pi*x))-integrate(function(x){2*x*(1-sin(4*pi*x))},lower=0,upper=1)$value)},lower=0,upper=1)$value, #pred 1
+                         integrate(function(x){abs(4*x-integrate(function(x){4*x},lower=0,upper=1)$value)},lower=0,upper=1)$value, #pred 2
+                         integrate(function(x){abs(ifelse(x<=0.5,2*x,4*x)-integrate(function(x){ifelse(x<=0.5,2*x,4*x)},lower=0,upper=1)$value)},lower=0,upper=1)$value, #pred 3
+                         integrate(function(x){abs(ifelse(x>0.5,8*x-4,0)-integrate(function(x){ifelse(x>0.5,8*x-4,0)},lower=0,upper=1)$value)},lower=0,upper=1)$value, #pred 4
+                         integrate(function(x){abs(ifelse(abs(x-0.5)>0.25,4*x,0)-integrate(function(x){ifelse(abs(x-0.5)>0.25,4*x,0)},lower=0,upper=1)$value)},lower=0,upper=1)$value, #pred 5
+                         integrate(Vectorize(function(x){abs(integrate(function(z){ifelse(z>0.75,4*x,0)},lower=0,upper=1)$value-integrate(Vectorize(function(x){integrate(function(z){ifelse(z>0.75,4*x,0)},lower=0,upper=1)$value}),lower=0,upper=1)$value)}),lower=0,upper=1)$value, #pred 6
+                         integrate(Vectorize(function(x){abs(integrate(Vectorize(function(z){ifelse(x>0.75,4*z,0)}),lower=0,upper=1)$value-integrate(Vectorize(function(x){integrate(Vectorize(function(z){ifelse(x>0.75,4*z,0)}),lower=0,upper=1)$value}),lower=0,upper=1)$value)}),lower=0,upper=1)$value, #pred 7
+                         rep(0,p-7))/data_info$sd_y #everything else. also, divide by SDy
+
+#Re-arrange the dataframe for plotting
+imp_measures=data.frame(val=c(as.matrix(imp_measures[,-1])),predictor=imp_measures[,1],type=rep(c('Percentage significant','CI distance','Shapley','CI width','Friedman-Popescu','Target'),each=p))
+
+#Plot
+ggplot(imp_measures[imp_measures$predictor<=10 & imp_measures$type != 'CI width',], aes(x = as.factor(predictor), y = val, fill = type)) +
+  geom_bar(stat = "identity", position = position_dodge2(width=10,padding=0.1)) +
+  facet_grid( ~ type, scales = "fixed") +
+  labs(x = "Predictor", y = "Value") +
+  theme_bw()+
+  theme(strip.text.x = element_text(size=13),axis.text=element_text(size=15),
+        axis.title=element_text(size=15),)+
+  guides(fill='none')
+```
+
+
+# Ensure good RF fit
+
+```{r}
+rf_model=readRDS('RF_fit.Rda')
+df=data.frame(x=1:500,y=rf_model$mse)
+
+ggplot(df, aes(x = x, y = y)) +
+  geom_line() +  # Add a line
+  labs(x = "Out of Bag MSE", y = "Number of trees") +  # Set axis labels
+  theme_minimal() +  # Use a simple theme
+  theme(
+    axis.text = element_text(size = 16),  # Adjust axis text size
+    axis.title = element_text(size = 20)  # Adjust axis title (label) size
+  )+ylim(0,1.2)
+```

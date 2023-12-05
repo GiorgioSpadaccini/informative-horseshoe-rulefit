@@ -1,0 +1,369 @@
+---
+title: "Simulation"
+author: "Giorgio Spadaccini"
+date: '2023-05-04'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 15, fig.height = 10)
+```
+
+# Prepare setting
+
+## Load libraries
+```{r}
+library("pre")
+library("ggplot2")
+library("ggthemes")
+library("MASS")
+library("ecpc")
+library("squeezy")
+library('randcorr')
+library('mvtnorm')
+library('partykit')
+library('beepr')
+library('mlbench')
+library('glmnet')
+library('stringr')
+library('dplyr')
+library('patchwork')
+library('Matrix')
+library('data.table')
+library('treeshap')
+library('randomForest')
+library('xgboost')
+library('horseshoe')
+library('horserule')
+library('ggforce')
+```
+
+
+## Define the Shapley functions
+
+### Auxiliary objects: create id_mat and Rs
+```{r}
+RuleMats=function(rules,x_df){
+  rules_separated=str_split_fixed(rules," & ",n=1+max(str_count(rules,'&')))
+  vars_in_term <- gsub( " .*$", "",rules_separated)
+
+  #Codify rules_separated into coding language
+  Rulesmat=matrix(paste0("x_df$",rules_separated),ncol=ncol(rules_separated))
+  Rulesmat[Rulesmat=="x_df$"]=""
+
+  #Some subrules might involve the same predictor. Those, we'd still like together
+  for(i in 1:nrow(vars_in_term)){
+    for(x_name in unique(vars_in_term[i,])){
+      #unique(vars_in_term[i,]) also includes the name "". Skip that case
+      if(x_name==''){
+        next
+      }
+      
+      #Find all spots sharing the same predictor x_name
+      indices=which(x_name==vars_in_term[i,])
+  
+      #Join back these subrules in rules_separated, place them in first occurrance
+      rules_separated[i,indices[1]]=paste(rules_separated[i,indices],collapse=' & ')
+      #In the remaining spots, we need to delete the subrule, it was already merged
+      rules_separated[i,indices[-1]]=''
+  
+      #Do the same with Rulesmat
+      Rulesmat[i,indices[1]]=paste(Rulesmat[i,indices],collapse=' & ')
+      Rulesmat[i,indices[-1]]=''
+
+      #Do the same with vars_in_term (nothing to collapse, only delete copies)
+      vars_in_term[i,indices[-1]]=''
+      }
+  }
+  #Define a matrix where M_{i,j} tells if x_j is involved in the i-th rule
+  x_names <- names(x_df)
+  id_mat <- t(apply(vars_in_term,MARGIN=1,FUN=function(x){x_names %in% x}))
+  
+  #Rulesmat defined the rules in coding. Create a function that runs it
+  parseval=function(text){return(eval(parse(text=text)))}
+
+  #Use this function to create a list of matrices. Each matrix is \{R_i(x^{(j)}_i)\}_{i,j}
+  Rs=lapply(1:nrow(Rulesmat),function(i){
+      R=matrix(unlist(apply(Rulesmat[i,,drop=F],MARGIN=2,FUN=parseval)),nrow=nrow(x_df))
+      colnames(R)=vars_in_term[i,vars_in_term[i,]!='']
+    
+      #Using vars_in_mat, reorder the matrices by predictor
+      R=R[,order(as.numeric(gsub('x.','',vars_in_term[i,vars_in_term[i,]!='']))),drop=F]
+      return(R)
+  })
+
+  return(list(RulePredMat=id_mat,Rs=Rs))
+}
+```
+
+
+
+# Load data
+
+```{r}
+#Load data
+load('dataset.Rdata')
+
+#Artificially add quadratic effect
+helius4$quadratic=rnorm(nrow(helius4))
+helius4$chol=helius4$quadratic^2/8+helius4$chol
+
+#Move y at the end, quadratic effect before noise
+helius4=helius4[,c(2:11,16,12:15,1)]
+
+#Recode it and re-order it
+whole_data=helius4[,-(3:6)]
+whole_data$etn=as.factor((10+helius4$etnGhan+2*helius4$etnMar+3*helius4$etnSur+4*helius4$etnTur)/2)
+whole_data=whole_data[,c(1:2,13,3:12)]
+
+#Rename variables
+names(whole_data)=c(paste0('x.',1:12),'y')
+
+#Split in test and training set
+n=2e3
+p=ncol(helius4)-1 #here p counts ethnicity multiple times
+p_small=ncol(whole_data)-1 #here p does not count ethnicity multiple times
+
+train_sample=sample(nrow(whole_data),n)
+train_data=whole_data[train_sample,]
+test_data=whole_data[-train_sample,]
+
+#Rescale outcome. MUy,SDy will be saved later
+SDy=sd(train_data$y)
+MUy=mean(train_data$y)
+train_data$y=(train_data$y-MUy)/SDy
+```
+
+
+# Use RuleFit (pre) and HorseRule to build the rules and the matrices X,Y
+
+```{r}
+#Set seed
+set.seed(42)
+
+#Fit models
+pre_fit <- pre(y ~ ., data = train_data, verbose = TRUE, maxdepth = 3,fit.final=F)
+HR_fit=horserule::HorseRuleFit(X = train_data[,1:(ncol(train_data)-1)], y=train_data$y, ensemble = "both", ntree=500, linterms=c(1:2,4:p_small),
+                                      restricted = 0,alpha=1, beta=2,
+                               niter=5,burnin=1) #no iterations are really needed, only rules
+#Start with HR rules
+rules=gsub('X\\[,','x.',HR_fit$rules)
+rules=gsub('\\]',' ',rules)
+#Add pre rules
+rules=c(pre_fit$rules$description,rules)
+
+#Save rules
+saveRDS(rules,'rules.Rda')
+```
+
+Build X and Y
+
+```{r}
+rules=readRDS('rules.Rda')
+
+modmat=pre:::get_modmat(formula = y ~., data = train_data,
+                             rules = rules,
+                             type = "both", x_names = paste0("x.", 1:(ncol(train_data)-1)),
+                             winsfrac = 0.05, normalize = T, y_names = "y")
+
+modmat$x[,1:p]=2.5*modmat$x[,1:p] #modmat normalizes predictors to sd=0.4. Make it 1
+#leave rules unstandardized, but use -1,1 encoding
+modmat$x[,c(2,7,9)]=sign(modmat$x[,c(2,7,9)])
+modmat$x[,3:6]=ifelse(modmat$x[,3:6]>0,2,-0.5)
+
+X <- modmat$x #uncentered. They are centered later
+Y <- modmat$y
+
+#Save MUy,SDy and MUx.
+saveRDS(list(mu_y=MUy,sd_y=SDy,mu_x=apply(X,MARGIN=2,FUN=mean)),'data_info.Rda')
+```
+
+
+# Fit models
+## Linear model
+
+```{r}
+#Set seed
+LM_fit=lm(chol~.,helius4[train_sample,])
+```
+
+
+## Informative Horseshoe RuleFit
+```{r}
+CD1_ihs_fit=function(mu,eta,X,Y){
+  penaliz=apply(X[,-(1:p)],MARGIN=2,FUN=function(x){(2*min(mean(x),1-mean(x)))^mu/sd(x)})/
+    rowSums(RuleMats(rules,train_data[,-(p+1)])$RulePredMat)^eta
+  #Penalize X
+  X[,-(1:p)]=X[,-(1:p)]*rep(penaliz,each=nrow(X))
+  #Center X
+  X=apply(X,MARGIN=2,FUN=function(x){x-mean(x)})
+  
+  D=1
+  Z=list()
+  Z[[1]] = matrix(c(rep(1,p),rep(0,ncol(X)),rep(1,ncol(X)-p)),ncol=2)
+
+  X <- cbind(1,X)
+  ## Fit infHS
+  ihs_fit = infHS::infHS_VB(y = Y, X = X, Z = Z,
+                            M = 2, #M=\sum_i^D(ncol(Z[[i]]))
+                            hyp_sigma = c(1, 10), #hyperparameters v,q s.t. sigma~IG(v,q)
+                            a_k = rep(1, D), b_k = rep(10, D), #hyperparameters a_k,b_k s.t. kappa_k~IG(a_k,b_k) for every k
+                            eps = 0.001, ping = 250, bmax = 3e3)
+  
+  return(list(iHS_fit=ihs_fit,scaling=c(rep(1,p),penaliz)))
+}
+
+set.seed(42)
+quick_fit=CD1_ihs_fit(1,2,X,Y)
+saveRDS(quick_fit,'quick_fit.Rda')
+```
+
+# Compare performance
+
+## Build test matrices
+
+```{r}
+#Load data info and ihs fit
+data_info=readRDS('data_info.Rda')
+
+#Generate test matrix
+test_modmat=pre:::get_modmat(formula = y ~., data = test_data,
+                             rules = rules,
+                             type = "both", x_names = paste0("x.", 1:(ncol(train_data)-1)),
+                             winsfrac=0.05, normalize = TRUE, y_names = "y")
+test_modmat$x[,1:p]=2.5*test_modmat$x[,1:p]
+#leave rules unstandardized, but use -1,1 encoding
+test_modmat$x[,c(2,7,9)]=sign(test_modmat$x[,c(2,7,9)])
+test_modmat$x[,3:6]=ifelse(test_modmat$x[,3:6]>0,2,-0.5)
+
+#Adjust scale and offset as per training data
+Y_test <- (test_data$y-data_info$mu_y)/data_info$sd_y
+X_test <- test_modmat$x-rep(data_info$mu_x,each=nrow(test_modmat$x))
+```
+
+## Compute MSEs
+
+```{r}
+quick_fit=readRDS('quick_fit.Rda')
+
+MSEs=rep(NA,2)
+names(MSEs)=c('Linear Fit','Informative Horseshoe Fit')
+MSEs[1]=mean((helius4$chol[-train_sample]-predict(LM_fit,helius4[-train_sample,]))^2)/data_info$sd_y^2
+MSEs[2]=mean((Y_test-cbind(1,X_test)%*%(quick_fit$iHS_fit$beta*c(1,quick_fit$scaling)))^2)
+MSEs
+```
+
+
+# Shapley values
+
+## Linear Fit
+```{r}
+shapleys_raw=apply(as.matrix(helius4[train_sample,-16]),2,function(x){x-mean(x)})*rep(LM_fit$coefficients[-1],each=n)
+lin_shapleys=c(shapleys_raw[,1:2],rowSums(shapleys_raw[,3:6]),shapleys_raw[,7:p])
+```
+
+## Inf. Horseshoe Fit
+
+We manually edit the function we'd normally use, since we need to customize it for a non-dychotomous categorical predictor.
+```{r}
+#Use auxiliary function
+rule_objects=RuleMats(rules,train_data[,-ncol(train_data)])
+
+#Build weight matrix
+P=ncol(X)
+row_indices=c(1:(n*2),rep((2*n)+(1:n),times=4),(3*n+1):(n*p_small))
+Shapleymat=sparseMatrix(i=row_indices,j=rep(1:p,each=n),
+                          dims=c(n*p_small,P), x=c(apply(X[,1:p],MARGIN=2,function(x){x-mean(x)})))
+
+#create a progress bar
+pb = txtProgressBar(min = 0, max = length(rule_objects$Rs), initial = 0,style=3) 
+  
+#Go through all the rule contributions one by one
+for(i in 1:length(rule_objects$Rs)){
+  d=ncol(rule_objects$Rs[[i]])
+  #If d=1, then the contribution is like for linear terms
+  if(d==1){
+    #Involved predictor
+    inv_pred=which(rule_objects$RulePredMat[i,]==1)
+    
+    #Update matrix. Multiply by n cause it's divided by n in the end 
+    Shapleymat[(inv_pred-1)*n+1:n,p+i]=c(rule_objects$Rs[[i]]-mean(rule_objects$Rs[[i]]))
+    next
+  }
+  #Otherwise, id d>1, we compute the Shapleys properly
+  SSt=tcrossprod(!rule_objects$Rs[[i]])
+  SSt_checks=which(SSt==0,arr.ind = T)
+  SSt_points=data.frame(x=SSt_checks[,1],y=SSt_checks[,2])
+  
+  #Now go through all involved predictors and update the contribution df
+  inv_pred=which(rule_objects$RulePredMat[i,]==1)
+    
+  for(j in 1:d){
+    #check the extra condition R_i(x_i)R_i(y_i)=0. These points are contributing
+    contributions=SSt_points[(rule_objects$Rs[[i]][SSt_points$x,j]*rule_objects$Rs[[i]][SSt_points$y,j])==0,]
+      
+    #For these points, compute the weights.
+    qx=d-diag(SSt)-rule_objects$Rs[[i]][,j]
+    contributions$weights=
+      (rule_objects$Rs[[i]][contributions$x,j]-rule_objects$Rs[[i]][contributions$y,j])/
+      (n*(d-qx[contributions$x])*
+                 choose(2*d-qx[contributions$x]-qx[contributions$y]-1,d-qx[contributions$x]))
+      
+    sum_contributions=contributions |> group_by(x) |> summarise(contribution=sum(weights))
+      
+    #Add the weights to the matrix
+    Shapleymat[(inv_pred[j]-1)*n+sum_contributions$x,p+i]=sum_contributions$contribution
+    }
+    
+    #Update progress bar
+    setTxtProgressBar(pb,i)
+  }
+  
+#close progress bar
+close(pb)
+  
+
+saveRDS(Shapleymat,'Shapleymat.Rda')
+```
+
+```{r}
+#Load shapley weights
+Shapleymat=readRDS('Shapleymat.Rda')
+
+#Compute shapley values from weight matrix
+ihs_shapleys=Shapleymat%*%(quick_fit$iHS_fit$beta[-1]*quick_fit$scaling)
+```
+
+## Comparison
+
+```{r}
+#Create dataframe
+loc_imps=data.frame(x=c(as.numeric(as.matrix(train_data[,1:p_small]))),shapley=c(lin_shapleys,as.matrix(ihs_shapleys)),type=rep(c('Linear Fit','Informative Horseshoe Fit'),each=n*p_small),
+                    predictor=rep(c(names(helius4)[1:2],'etn',names(helius4)[7:p]),each=n))
+loc_imps$predictor=as.factor(loc_imps$predictor)
+#Plot results
+ggplot(loc_imps, aes(x = x, y = shapley, color = type)) +
+  geom_point(size=0.5) +
+  geom_line(aes(group=type))+
+  facet_grid(predictor ~ ., scales = "fixed") +
+  labs(x = "x", y = "Contribution") +
+  theme_bw()
+```
+
+
+## Global importance measures
+
+```{r}
+imp_measures = loc_imps %>% group_by(predictor) %>% 
+  summarise(shap=mean(abs(shapley)))
+
+imp_measures=imp_measures[order(imp_measures$predictor),]
+
+ggplot(imp_measures, aes(x = as.factor(predictor), y = shap)) +
+  geom_bar(stat = "identity", position = position_dodge2(width=10,padding=0.1)) +
+  labs(x = "Predictor", y = "Value") +
+  theme_bw()+
+  theme(strip.text.x = element_text(size=13),axis.text=element_text(size=15),
+        axis.title=element_text(size=15),)+
+  guides(fill='none')
+```
